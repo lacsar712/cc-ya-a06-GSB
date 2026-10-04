@@ -1,4 +1,4 @@
-"""后台 worker：用 SKIP LOCKED 认领 pending 记录并写入判定结论。"""
+"""后台 worker：用 SKIP LOCKED 认领 pending 记录，按认领时刻的琥珀带判定并快照留存。"""
 
 import os
 import time
@@ -7,16 +7,11 @@ from datetime import datetime, timezone
 import psycopg
 from psycopg.rows import dict_row
 
-from db import SCHEMA, connect
-from rules import judge
+from db import connect, current_band, ensure_schema
+from rules import DEFAULT_INNER_DEG, DEFAULT_OUTER_DEG, judge
 
 POLL_SEC = float(os.environ.get("WORKER_POLL_SEC", "0.5"))
 IDLE_SEC = float(os.environ.get("WORKER_IDLE_SEC", "1.0"))
-
-
-def ensure_schema(conn):
-    conn.execute(SCHEMA)
-    conn.commit()
 
 
 def claim_and_process(conn) -> bool:
@@ -31,13 +26,18 @@ def claim_and_process(conn) -> bool:
         ).fetchone()
         if row is None:
             return False
-        verdict, reason = judge(float(row["yaw_err_deg"]))
+        # 领时快照：认领瞬间的生效琥珀带写入行内，之后改带不影响本单
+        band = current_band(conn)
+        inner = float(band["inner_deg"]) if band else DEFAULT_INNER_DEG
+        outer = float(band["outer_deg"]) if band else DEFAULT_OUTER_DEG
+        verdict, reason = judge(float(row["yaw_err_deg"]), inner, outer)
         now = datetime.now(timezone.utc)
         conn.execute(
             """UPDATE yaw_logs
-               SET status = 'done', verdict = %s, reason = %s, processed_at = %s
+               SET status = 'done', verdict = %s, reason = %s,
+                   band_inner_deg = %s, band_outer_deg = %s, processed_at = %s
                WHERE id = %s""",
-            (verdict, reason, now, row["id"]),
+            (verdict, reason, inner, outer, now, row["id"]),
         )
     return True
 
@@ -46,6 +46,7 @@ def main():
     print("yaw-align worker started", flush=True)
     with connect() as conn:
         ensure_schema(conn)
+        conn.commit()
     while True:
         try:
             with connect() as conn:

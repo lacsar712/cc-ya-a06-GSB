@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -7,8 +8,8 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from quart import Quart, jsonify, request
 
-from db import SCHEMA, connect
-from rules import judge
+from db import connect, current_band, ensure_default_band, ensure_schema
+from rules import DEFAULT_INNER_DEG, DEFAULT_OUTER_DEG, judge
 
 SECRET = os.environ.get("JWT_SECRET", "yaw-align-dev-secret")
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -36,7 +37,8 @@ async def run_db(fn, *args, **kwargs):
 
 
 def seed_if_empty(conn):
-    conn.execute(SCHEMA)
+    ensure_schema(conn)
+    ensure_default_band(conn, DEFAULT_INNER_DEG, DEFAULT_OUTER_DEG)
     count = conn.execute("SELECT COUNT(*) AS n FROM yaw_logs").fetchone()["n"]
     if count > 0:
         return
@@ -46,14 +48,25 @@ def seed_if_empty(conn):
         ("W07", 3.2, "偏航超差"),
     ]
     for code, err, expected_verdict in samples:
-        verdict, reason = judge(err)
+        verdict, reason = judge(err, DEFAULT_INNER_DEG, DEFAULT_OUTER_DEG)
         assert verdict == expected_verdict
         conn.execute(
             """INSERT INTO yaw_logs
                (turbine_code, yaw_err_deg, status, verdict, reason,
+                band_inner_deg, band_outer_deg,
                 created_by, created_at, processed_at)
-               VALUES (%s, %s, 'done', %s, %s, %s, %s, %s)""",
-            (code, err, verdict, reason, "technician", now, now),
+               VALUES (%s, %s, 'done', %s, %s, %s, %s, %s, %s, %s)""",
+            (
+                code,
+                err,
+                verdict,
+                reason,
+                DEFAULT_INNER_DEG,
+                DEFAULT_OUTER_DEG,
+                "technician",
+                now,
+                now,
+            ),
         )
 
 
@@ -99,17 +112,22 @@ def require_login(handler):
     return wrapper
 
 
-def require_writer(handler):
-    @wraps(handler)
-    async def wrapper(*args, **kwargs):
-        user = await current_user()
-        if user is None:
-            return jsonify({"detail": "未登录"}), 401
-        if user["role"] != "writer":
-            return jsonify({"detail": "仅现场技师可提交偏航记录"}), 403
-        return await handler(user, *args, **kwargs)
+def require_writer(handler=None, *, forbidden="仅现场技师可提交偏航记录"):
+    """写权限装饰器：@require_writer 或 @require_writer(forbidden="...") 两种用法。"""
 
-    return wrapper
+    def deco(fn):
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            user = await current_user()
+            if user is None:
+                return jsonify({"detail": "未登录"}), 401
+            if user["role"] != "writer":
+                return jsonify({"detail": forbidden}), 403
+            return await fn(user, *args, **kwargs)
+
+        return wrapper
+
+    return deco(handler) if handler is not None else deco
 
 
 @app.get("/api/health")
@@ -147,6 +165,7 @@ async def list_logs(user):
         with connect() as conn:
             return conn.execute(
                 """SELECT id, turbine_code, yaw_err_deg, status, verdict, reason,
+                          band_inner_deg, band_outer_deg,
                           created_by, created_at, processed_at
                    FROM yaw_logs ORDER BY id DESC"""
             ).fetchall()
@@ -177,6 +196,7 @@ async def create_log(user):
                     created_by, created_at)
                    VALUES (%s, %s, 'pending', NULL, NULL, %s, %s)
                    RETURNING id, turbine_code, yaw_err_deg, status, verdict, reason,
+                             band_inner_deg, band_outer_deg,
                              created_by, created_at, processed_at""",
                 (turbine_code, yaw_err_deg, user["username"], now),
             ).fetchone()
@@ -185,3 +205,55 @@ async def create_log(user):
 
     row = await run_db(insert)
     return jsonify(row), 201
+
+
+def _band_payload(conn):
+    band = current_band(conn)
+    history = conn.execute(
+        """SELECT id, inner_deg, outer_deg, changed_by, changed_at
+           FROM band_settings ORDER BY id DESC"""
+    ).fetchall()
+    return {"current": band, "history": history}
+
+
+@app.get("/api/band")
+@require_login
+async def get_band(user):
+    def query():
+        with connect() as conn:
+            return _band_payload(conn)
+
+    return jsonify(await run_db(query))
+
+
+@app.put("/api/band")
+@require_writer(forbidden="观察账号只读，不可改带")
+async def update_band(user):
+    body = await request.get_json(force=True, silent=True) or {}
+    try:
+        inner_deg = float(body.get("inner_deg"))
+        outer_deg = float(body.get("outer_deg"))
+    except (TypeError, ValueError):
+        return jsonify({"detail": "内界、外界必须是数字"}), 400
+    if not (math.isfinite(inner_deg) and math.isfinite(outer_deg)):
+        return jsonify({"detail": "内界、外界必须是有限数字"}), 400
+    if inner_deg <= 0:
+        return jsonify({"detail": "内界必须大于 0"}), 400
+    if outer_deg <= inner_deg:
+        return jsonify({"detail": "外界必须大于内界"}), 400
+
+    now = datetime.now(timezone.utc)
+
+    def insert():
+        with connect() as conn:
+            conn.execute(
+                """INSERT INTO band_settings (inner_deg, outer_deg, changed_by, changed_at)
+                   VALUES (%s, %s, %s, %s)""",
+                (inner_deg, outer_deg, user["username"], now),
+            )
+            payload = _band_payload(conn)
+            conn.commit()
+            return payload
+
+    # 改带仅作用于之后被认领的新单；已被领记录仍按领时快照判定
+    return jsonify(await run_db(insert))
